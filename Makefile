@@ -2,7 +2,7 @@
 
 ARCH := $(shell uname -p)
 
-CXXOPTS := -O2 -std=c++17 -Wall
+CXXOPTS := -O2 -std=c++17 -g -Wall
 ifeq ($(ARCH),x86_64)
 CXXOPTS += -mpclmul
 endif
