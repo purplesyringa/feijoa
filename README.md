@@ -56,7 +56,7 @@ uint64_t hash = feijoa.reduce(array.data(), array.size());
 
 The length of the array must be divisible by 16.
 
-Hashes provided by different instances of Feijoa must not be compared: no cryptographic guarantees are made about them.
+Hashes provided by different instances of Feijoa must not be compared: no cryptographic guarantees are made about them. However, it *is* a good idea to create a new Feijoa for each separate use, to make sure accidentally leaking a salt or a hash cannot lead to an attack on another part of the program.
 
 A seed can be extracted from a Feijoa instance to re-create it later:
 
@@ -72,3 +72,14 @@ If you wish to increase security by increasing hash length, do NOT create `Feijo
 ```cpp
 std::array<Feijoa, 2> feijoas = Feijoa::random_many<2>(generator);
 ```
+
+
+## How it works
+
+Implementation-wise, Feijoa is just CRC64 with a random irreducible polynomial used as the modulo. Doesn't sound so ingenious anymore, does it? :-)
+
+While using CRC for cryptographic purposes immediately raises alarms, CRC's bad publicity only covers the use cases that Feijoa explicitly avoids. The critical differences are that Feijoa uses a dynamic polynomial and both the hashes and the modulo are kept secret. These conditions are reasonable in many cases, which is why Feijoa thrives where CRC fails.
+
+Basing on CRC also lets Feijoa reuse many optimizations Intel has introduced into the ISA for CRC and other cryptographic operations. For instance, Feijoa uses the `pclmul` instruction to consume 8 bytes from the input stream at once with the highest possible degree of parallelism.
+
+An important thing to notice is that Feijoa puts quite a bit of thought into optimizating the generation of random irreducible polynomials. On my Haswell, Feijoa manages to generate 338k random irreducible polynomials per second, which amounts to 338k instantiations of e.g. a hashmap. This investment into performance is in hope that developers avoid sharing a Feijoa instance between multiple hashtables. Indeed, isolating Feijoas by using exactly one Feijoa per hashtable reduces the scope of attacks if the salt or the hash get leaked.
