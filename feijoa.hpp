@@ -500,9 +500,7 @@ class Feijoa {
                 // probability of:
                 //     ((deg a(x) / 64) choose k) / (2^58 choose k)
                 //     ~ ((deg a(x) / 64) choose k) / (2^(58k) / k!)
-                // For the common case where deg a(x) / 64 is significantly larger than k, this can
-                // be approximated as
-                //     ((deg a(x) / 64)^k / k!) / (2^(58k) / k!)
+                //     <= ((deg a(x) / 64)^k / k!) / (2^(58k) / k!)  [actually ~ for large a(x)]
                 //     = (deg a(x) / 2^64)^k,
                 // which proves that the probability is exponential in k.
                 //
