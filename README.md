@@ -4,7 +4,7 @@
 
 It provides the same interface that typical salted hash functions provide: you initialize a hasher object with a salt, which then allows you to compute 64-bit hashes of byte objects. However, the security guarantees differ from those of typical hash functions like xxhash or SHA:
 
-- On a positive note, a Feijoa *with an unknown salt* provides *provable* guarantees about collisions. This is a good thing, because you don't have to trust a hash function just because it passed SMHasher, and it guards against accidental and intentional backdoors. If the probabilities are too high for your use case, you can create several Feijoa objects with different salts, and the collision rate will *provably* decrease exponentially. The guarantees are:
+- On a positive note, a Feijoa *with an unknown salt* provides *mathematical* guarantees about collisions. This is a good thing, because you don't have to trust a hash function just because it passed SMHasher, and it guards against accidental and intentional backdoors. If the probabilities are too high for your use case, you can create several Feijoa objects with different salts, and the collision rate can be *proved* to decrease exponentially. The guarantees are:
 	- Hashes of two maliciously generated N-byte strings collide with probability less than `N * 2^-61`.
 	- Hashes of two randomly generated strings collide with probability `2^-64`.
 - On a negative note, if the salt or the hash values are ever leaked, generating collisions is trivial.
@@ -30,7 +30,7 @@ Here's a checklist to see if Feijoa is safe for your use case:
 - Do side-channel attacks apply to you? If yes, Feijoa is *likely* not for you.
 - Can timing attacks be performed to determine information about a hash? For instance, can a malicious actor measure the time taken to access an element of a hash table that doesn't fit in cache? If yes, Feijoa is *likely* not for you.
 
-If the malicious actor has no direct access to the runtime that uses Feijoa and has no way to learn the salt or the hash values, you are *provably* safe.
+If the malicious actor has no direct access to the runtime that uses Feijoa and has no way to learn the salt or the hash values, it can be *proven* that you are safe.
 
 
 ## Usage
