@@ -5,10 +5,19 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <immintrin.h>
 #include <random>
 #include <type_traits>
 #include <utility>
+
+#ifdef __x86_64__
+#include <immintrin.h>
+#define FEIJOA_VECTOR_TYPE __m128i
+#endif
+
+#ifdef __aarch64__
+#include <arm_neon.h>
+#define FEIJOA_VECTOR_TYPE poly64x2_t
+#endif
 
 class Feijoa {
 #ifdef TRUSTEDHASH_TESTS
@@ -17,11 +26,11 @@ class Feijoa {
   protected:
 #endif
     // Low half stores p(x) + x^64, high half stores x^128 // p(x) + x^64.
-    __m128i low_p_low_x_128_div_p;
+    FEIJOA_VECTOR_TYPE low_p_low_x_128_div_p;
     // Low half stores x^128 mod p(x), high half stores x^192 mod p(x).
-    __m128i x_128_x_192;
+    FEIJOA_VECTOR_TYPE x_128_x_192;
     // Low half stores x^512 mod p(x), high half stores x^576 mod p(x).
-    __m128i x_512_x_576;
+    FEIJOA_VECTOR_TYPE x_512_x_576;
 
     inline uint64_t init_for_basic_computations(uint64_t coeffs) {
         // Let
@@ -119,24 +128,103 @@ class Feijoa {
         quotient ^= ((quotient >> 2) & 0x1249249249249249) * (coeffs >> 62);
         quotient ^= ((quotient >> 1) & 0x1249249249249249) * (coeffs >> 63);
 
-        low_p_low_x_128_div_p = _mm_set_epi64x(quotient, coeffs);
+        low_p_low_x_128_div_p = polynomial_pair(coeffs, quotient);
 
         uint64_t x_128 = acc;
-        uint64_t x_192 = reduce(_mm_set_epi64x(x_128, 0));
-        x_128_x_192 = _mm_set_epi64x(x_192, x_128);
+        uint64_t x_192 = reduce(polynomial_pair(0, x_128));
+        x_128_x_192 = polynomial_pair(x_128, x_192);
         return x_128;
     }
 
+    static inline FEIJOA_VECTOR_TYPE polynomial_pair(uint64_t low, uint64_t high) {
+#ifdef __x86_64__
+        return _mm_set_epi64x(high, low);
+#else
+        return vcombine_p64(vcreate_p64(low), vcreate_p64(high));
+#endif
+    }
+
+    static inline FEIJOA_VECTOR_TYPE polynomial_load_unaligned(const FEIJOA_VECTOR_TYPE *p) {
+#ifdef __x86_64__
+        return _mm_loadu_si128(p);
+#else
+        return vreinterpretq_p64_s8(vld1q_s8(reinterpret_cast<const int8_t *>(p)));
+#endif
+    }
+
+    static inline FEIJOA_VECTOR_TYPE polynomial_multiply_low(FEIJOA_VECTOR_TYPE a,
+                                                             FEIJOA_VECTOR_TYPE b) {
+#ifdef __x86_64__
+        return _mm_clmulepi64_si128(a, b, 0x00);
+#else
+        poly64x2_t result;
+        asm("pmull %0.1q, %1.1d, %2.1d" : "=w"(result) : "w"(a), "w"(b));
+        return result;
+#endif
+    }
+
+    static inline FEIJOA_VECTOR_TYPE polynomial_multiply_high(FEIJOA_VECTOR_TYPE a,
+                                                              FEIJOA_VECTOR_TYPE b) {
+#ifdef __x86_64__
+        return _mm_clmulepi64_si128(a, b, 0x11);
+#else
+        poly64x2_t result;
+        asm("pmull2 %0.1q, %1.2d, %2.2d" : "=w"(result) : "w"(a), "w"(b));
+        return result;
+#endif
+    }
+
+    static inline FEIJOA_VECTOR_TYPE polynomial_multiply_low_high(FEIJOA_VECTOR_TYPE a,
+                                                                  FEIJOA_VECTOR_TYPE b) {
+#ifdef __x86_64__
+        return _mm_clmulepi64_si128(a, b, 0x10);
+#else
+        return polynomial_multiply_high(vdupq_laneq_p64(a, 0), b);
+#endif
+    }
+
+    static inline FEIJOA_VECTOR_TYPE polynomial_add(FEIJOA_VECTOR_TYPE a, FEIJOA_VECTOR_TYPE b) {
+#ifdef __x86_64__
+        return _mm_xor_si128(a, b);
+#else
+        return vaddq_p64(a, b);
+#endif
+    }
+
+    static inline uint64_t polynomial_low(FEIJOA_VECTOR_TYPE a) {
+#ifdef __x86_64__
+        return _mm_cvtsi128_si64(a);
+#else
+        return vgetq_lane_u64(vreinterpretq_u64_p64(a), 0);
+#endif
+    }
+
+    static inline FEIJOA_VECTOR_TYPE polynomial_zero_high(FEIJOA_VECTOR_TYPE a) {
+#ifdef __x86_64__
+        return _mm_move_epi64(a);
+#else
+        return vsetq_lane_p64(0, a, 1);
+#endif
+    }
+
+    static inline bool has_pdep() {
+#ifdef __x86_64__
+        return __builtin_cpu_supports("bmi2");
+#else
+        return false;
+#endif
+    }
+
     inline void init_for_hashing(uint64_t x_128) {
-        __m128i x_256 = square(x_128, std::false_type{});
+        auto x_256 = square(x_128);
         uint64_t x_512 = reduce(square(x_256));
-        uint64_t x_576 = reduce(_mm_set_epi64x(x_512, 0));
-        x_512_x_576 = _mm_set_epi64x(x_576, x_512);
+        uint64_t x_576 = reduce(polynomial_pair(0, x_512));
+        x_512_x_576 = polynomial_pair(x_512, x_576);
     }
 
     // Generates a random irreducible polynomial of degree 64 using the given random bit generator.
-    template <typename Generator, typename UseBMI2>
-    static Feijoa random(Generator &generator, UseBMI2 use_bmi2) {
+    template <typename Generator, typename UsePdep>
+    static Feijoa random(Generator &generator, UsePdep use_pdep) {
         std::uniform_int_distribution<uint64_t> rng;
         while (true) {
             // A random p(x) is irreducible with probability around 1/64. Forcing
@@ -148,12 +236,12 @@ class Feijoa {
             // the current performance of Feijoa::Feijoa and is_quasi_irreducible_parallel,
             // depending on whether BMI2 is available.
 
-            std::array<Feijoa, use_bmi2 ? 6 : 4> feijoas;
-            std::array<uint64_t, use_bmi2 ? 6 : 4> x_128;
+            std::array<Feijoa, use_pdep ? 6 : 4> feijoas;
+            std::array<uint64_t, use_pdep ? 6 : 4> x_128;
             for (size_t i = 0; i < feijoas.size(); i++) {
                 x_128[i] = feijoas[i].init_for_basic_computations(fixup_coprime(rng(generator)));
             }
-            auto results = is_quasi_irreducible_parallel(feijoas, use_bmi2);
+            auto results = is_quasi_irreducible_parallel(feijoas, use_pdep);
             for (size_t i = 0; i < feijoas.size(); i++) {
                 auto [quasi_irreducible, payload] = results[i];
                 if (quasi_irreducible && feijoas[i].is_really_irreducible(payload)) {
@@ -173,48 +261,55 @@ class Feijoa {
     }
 
     // Given a(x), computes a representative of a(x)^2 (mod p(x)).
-    inline __m128i square(__m128i a) const {
+    inline FEIJOA_VECTOR_TYPE square(FEIJOA_VECTOR_TYPE a) const {
         // In F_2,
         //     ((high << 64) + low)^2 = (high^2 << 128) + low^2.
-        return _mm_xor_si128(shift_128(_mm_clmulepi64_si128(a, a, 0x11)),
-                             _mm_clmulepi64_si128(a, a, 0x00));
+        return polynomial_add(shift_128(polynomial_multiply_high(a, a)),
+                              polynomial_multiply_low(a, a));
     }
 
     // Given a(x), computes a representative of a(x)^2 (mod p(x)).
-    template <typename UseBMI2> __m128i square(uint64_t a, UseBMI2 use_bmi2) const {
-        if constexpr (use_bmi2) {
+    template <typename UsePdep> FEIJOA_VECTOR_TYPE square(uint64_t a, UsePdep use_pdep) const {
+        if constexpr (use_pdep) {
+#ifdef __x86_64__
             uint64_t high, low;
             asm("pdep %1, %2, %0" : "=r"(high) : "r"(0x5555555555555555), "r"(a >> 32));
             asm("pdep %1, %2, %0" : "=r"(low) : "r"(0x5555555555555555), "r"(a));
-            return _mm_set_epi64x(high, low);
+            return polynomial_pair(low, high);
+#else
+            __builtin_trap();
+#endif
         } else {
-            __m128i a_vec = _mm_set_epi64x(0, a);
-            return _mm_clmulepi64_si128(a_vec, a_vec, 0x00);
+            auto a_vec = polynomial_pair(a, 0);
+            return polynomial_multiply_low(a_vec, a_vec);
         }
     }
 
+    // Given a(x), computes a representative of a(x)^2 (mod p(x)).
+    inline FEIJOA_VECTOR_TYPE square(uint64_t a) const { return square(a, std::false_type{}); }
+
     // Given a(x), computes a representative of a(x) * x^128 (mod p(x)).
-    inline __m128i shift_128(__m128i a) const {
+    inline FEIJOA_VECTOR_TYPE shift_128(FEIJOA_VECTOR_TYPE a) const {
         // In F_2,
         //     ((high << 64) + low) << 128 = (high << 192) + (low << 128),
         // hence
         //     a << 128 = high * ((1 << 192) mod p(x)) + low * ((1 << 128) mod p(x)) (mod p(x)).
-        return _mm_xor_si128(_mm_clmulepi64_si128(a, x_128_x_192, 0x00),
-                             _mm_clmulepi64_si128(a, x_128_x_192, 0x11));
+        return polynomial_add(polynomial_multiply_low(a, x_128_x_192),
+                              polynomial_multiply_high(a, x_128_x_192));
     }
 
     // Given a(x), computes a representative of a(x) * x^512 (mod p(x)).
-    inline __m128i shift_512(__m128i a) const {
+    inline FEIJOA_VECTOR_TYPE shift_512(FEIJOA_VECTOR_TYPE a) const {
         // In F_2,
         //     ((high << 64) + low) << 512 = (high << 576) + (low << 512),
         // hence
         //     a << 512 = high * ((1 << 576) mod p(x)) + low * ((1 << 512) mod p(x)) (mod p(x)).
-        return _mm_xor_si128(_mm_clmulepi64_si128(a, x_512_x_576, 0x00),
-                             _mm_clmulepi64_si128(a, x_512_x_576, 0x11));
+        return polynomial_add(polynomial_multiply_low(a, x_512_x_576),
+                              polynomial_multiply_high(a, x_512_x_576));
     }
 
     // Given a(x), computes a(x) mod p(x).
-    inline uint64_t reduce(__m128i a) const {
+    inline uint64_t reduce(FEIJOA_VECTOR_TYPE a) const {
         // a(x) mod p(x) = ((high << 64) + low) mod p(x) = (high << 64) mod p(x) + low.
 
         // Perform Barrett reduction on (high << 64): we shall compute
@@ -230,12 +325,12 @@ class Feijoa {
         // which implies
         //     q(x) + q'(x) = A(x) / p(x) + (high * B(x) / p(x) + C(x)) / x^64,
         // which is a ratio of a negative degree but also a polynomial, i.e. 0.
-        __m128i garbage_q = _mm_xor_si128(a, _mm_clmulepi64_si128(a, low_p_low_x_128_div_p, 0x11));
+        auto garbage_q = polynomial_add(a, polynomial_multiply_high(a, low_p_low_x_128_div_p));
 
         // Compute the low 64 bits of
         //     a(x) mod p(x) = a(x) + q(x) * p(x).
-        return _mm_cvtsi128_si64(
-            _mm_xor_si128(a, _mm_clmulepi64_si128(garbage_q, low_p_low_x_128_div_p, 0x01)));
+        return polynomial_low(
+            polynomial_add(a, polynomial_multiply_low_high(low_p_low_x_128_div_p, garbage_q)));
     }
 
     // p(x) of degree d is irreducible over F_2 iff:
@@ -248,17 +343,17 @@ class Feijoa {
 
     // Tests if multiple p(x) pass a loose irreducibility check and returns initialization data for
     // a real check.
-    template <size_t N, typename UseBMI2>
+    template <size_t N, typename UsePdep>
     static std::array<std::pair<bool, uint64_t>, N>
-    is_quasi_irreducible_parallel(const std::array<Feijoa, N> &feijoas, UseBMI2 use_bmi2) {
+    is_quasi_irreducible_parallel(const std::array<Feijoa, N> &feijoas, UsePdep use_pdep) {
         // Wrap __m128i in a struct so that the template argument of std::conditional_t does not
         // have attributes that would be dropped, e.g. alignment. See:
         // - https://gcc.gnu.org/bugzilla/show_bug.cgi?id=97222
         // - https://bugs.llvm.org/show_bug.cgi?id=47674
-        struct wrapped_m128i {
-            __m128i wrapped;
+        struct wrapped_vector_t {
+            FEIJOA_VECTOR_TYPE wrapped;
         };
-        using element_type = typename std::conditional<use_bmi2, uint64_t, wrapped_m128i>::type;
+        using element_type = typename std::conditional<use_pdep, uint64_t, wrapped_vector_t>::type;
 
         element_type x_2_32[N];
 
@@ -266,17 +361,17 @@ class Feijoa {
 
         // Initialize with x^(2^7) mod p(x).
         for (size_t i = 0; i < N; i++) {
-            if constexpr (use_bmi2) {
-                x_2_32[i] = _mm_cvtsi128_si64(feijoas[i].x_128_x_192);
+            if constexpr (use_pdep) {
+                x_2_32[i] = polynomial_low(feijoas[i].x_128_x_192);
             } else {
-                x_2_32[i].wrapped = _mm_move_epi64(feijoas[i].x_128_x_192);
+                x_2_32[i].wrapped = polynomial_zero_high(feijoas[i].x_128_x_192);
             }
         }
 
         for (int i = 7; i < 32; i++) {
             for (size_t i = 0; i < N; i++) {
-                if constexpr (use_bmi2) {
-                    x_2_32[i] = feijoas[i].reduce(feijoas[i].square(x_2_32[i], use_bmi2));
+                if constexpr (use_pdep) {
+                    x_2_32[i] = feijoas[i].reduce(feijoas[i].square(x_2_32[i], use_pdep));
                 } else {
                     x_2_32[i].wrapped = feijoas[i].square(x_2_32[i].wrapped);
                 }
@@ -290,8 +385,8 @@ class Feijoa {
         }
         for (int i = 32; i < 64; i++) {
             for (size_t i = 0; i < N; i++) {
-                if constexpr (use_bmi2) {
-                    x_2_64[i] = feijoas[i].reduce(feijoas[i].square(x_2_64[i], use_bmi2));
+                if constexpr (use_pdep) {
+                    x_2_64[i] = feijoas[i].reduce(feijoas[i].square(x_2_64[i], use_pdep));
                 } else {
                     x_2_64[i].wrapped = feijoas[i].square(x_2_64[i].wrapped);
                 }
@@ -301,7 +396,7 @@ class Feijoa {
         std::array<std::pair<bool, uint64_t>, N> results;
         for (size_t i = 0; i < N; i++) {
             // x^(2^64) = x?
-            if constexpr (use_bmi2) {
+            if constexpr (use_pdep) {
                 results[i] = {x_2_64[i] == 2, x_2_32[i]};
             } else {
                 bool success = feijoas[i].reduce(x_2_64[i].wrapped) == 2;
@@ -312,14 +407,14 @@ class Feijoa {
     }
 
     // Tests if p(x) is quasi-irreducible.
-    template <typename UseBMI2>
-    std::pair<bool, uint64_t> is_quasi_irreducible(UseBMI2 use_bmi2) const {
-        return is_quasi_irreducible_parallel(std::array<Feijoa, 1>{*this}, use_bmi2)[0];
+    template <typename UsePdep>
+    std::pair<bool, uint64_t> is_quasi_irreducible(UsePdep use_pdep) const {
+        return is_quasi_irreducible_parallel(std::array<Feijoa, 1>{*this}, use_pdep)[0];
     }
 
     // Tests if p(x) is quasi-irreducible.
     inline std::pair<bool, uint64_t> is_quasi_irreducible() const {
-        if (__builtin_cpu_supports("bmi2")) {
+        if (has_pdep()) {
             return is_quasi_irreducible(std::true_type{});
         } else {
             return is_quasi_irreducible(std::false_type{});
@@ -358,8 +453,8 @@ class Feijoa {
     }
 
     // Tests if p(x) is irreducible.
-    template <typename UseBMI2> bool is_irreducible(UseBMI2 use_bmi2) const {
-        auto results = is_quasi_irreducible_parallel(std::array<Feijoa, 1>{*this}, use_bmi2);
+    template <typename UsePdep> bool is_irreducible(UsePdep use_pdep) const {
+        auto results = is_quasi_irreducible_parallel(std::array<Feijoa, 1>{*this}, use_pdep);
         auto [quasi_irreducible, payload] = results[0];
         return quasi_irreducible && is_really_irreducible(payload);
     }
@@ -374,7 +469,7 @@ class Feijoa {
 
     // Generates a random irreducible polynomial of degree 64 using the given random bit generator.
     template <typename Generator> static Feijoa random(Generator &generator) {
-        if (__builtin_cpu_supports("bmi2")) {
+        if (has_pdep()) {
             return random(generator, std::true_type{});
         } else {
             return random(generator, std::false_type{});
@@ -420,7 +515,7 @@ class Feijoa {
 
     // Tests if p(x) is irreducible.
     inline bool is_irreducible() const {
-        if (__builtin_cpu_supports("bmi2")) {
+        if (has_pdep()) {
             return is_irreducible(std::true_type{});
         } else {
             return is_irreducible(std::false_type{});
@@ -428,7 +523,7 @@ class Feijoa {
     }
 
     // Returns a seed that can be used to restore the Feijoa instance later.
-    inline uint64_t get_seed() const { return _mm_cvtsi128_si64(low_p_low_x_128_div_p); }
+    inline uint64_t get_seed() const { return polynomial_low(low_p_low_x_128_div_p); }
 
     // Computes the hash of an array whose length is a product of 16.
     inline uint64_t reduce(const char *data, size_t n) const {
@@ -445,28 +540,28 @@ class Feijoa {
         // guarantee if deg a(x) < 64. Using a power lower than 64 would break it for n = 0, which
         // is perhaps not a bad thing, really, but using 64 is free so why not.
 
-        const __m128i *casted = reinterpret_cast<const __m128i *>(data);
+        auto casted = reinterpret_cast<const FEIJOA_VECTOR_TYPE *>(data);
 
         size_t i = 0;
 
-        __m128i acc3 = _mm_setzero_si128();
-        __m128i acc2 = _mm_setzero_si128();
-        __m128i acc1 = _mm_setzero_si128();
-        __m128i acc0 = _mm_set_epi64x(1, 0);
+        auto acc3 = polynomial_pair(0, 0);
+        auto acc2 = polynomial_pair(0, 0);
+        auto acc1 = polynomial_pair(0, 0);
+        auto acc0 = polynomial_pair(0, 1);
         while (i + 64 <= n) {
-            acc3 = _mm_xor_si128(shift_512(acc3), _mm_loadu_si128(casted + i / 16));
-            acc2 = _mm_xor_si128(shift_512(acc2), _mm_loadu_si128(casted + i / 16 + 1));
-            acc1 = _mm_xor_si128(shift_512(acc1), _mm_loadu_si128(casted + i / 16 + 2));
-            acc0 = _mm_xor_si128(shift_512(acc0), _mm_loadu_si128(casted + i / 16 + 3));
+            acc3 = polynomial_add(shift_512(acc3), polynomial_load_unaligned(casted + i / 16));
+            acc2 = polynomial_add(shift_512(acc2), polynomial_load_unaligned(casted + i / 16 + 1));
+            acc1 = polynomial_add(shift_512(acc1), polynomial_load_unaligned(casted + i / 16 + 2));
+            acc0 = polynomial_add(shift_512(acc0), polynomial_load_unaligned(casted + i / 16 + 3));
             i += 64;
         }
-        __m128i acc = acc3;
-        acc = _mm_xor_si128(shift_128(acc), acc2);
-        acc = _mm_xor_si128(shift_128(acc), acc1);
-        acc = _mm_xor_si128(shift_128(acc), acc0);
+        auto acc = acc3;
+        acc = polynomial_add(shift_128(acc), acc2);
+        acc = polynomial_add(shift_128(acc), acc1);
+        acc = polynomial_add(shift_128(acc), acc0);
 
         while (i + 16 <= n) {
-            acc = _mm_xor_si128(shift_128(acc), _mm_loadu_si128(casted + i / 16));
+            acc = polynomial_add(shift_128(acc), polynomial_load_unaligned(casted + i / 16));
             i += 16;
         }
 

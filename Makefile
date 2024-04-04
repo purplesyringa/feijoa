@@ -1,6 +1,14 @@
 .PHONY: benchmark test format
 
-CXXOPTS := -O2 -std=c++17 -Wall -mpclmul
+ARCH := $(shell uname -p)
+
+CXXOPTS := -O2 -std=c++17 -Wall
+ifeq ($(ARCH),x86_64)
+CXXOPTS += -mpclmul
+endif
+ifeq ($(ARCH),aarch64)
+CXXOPTS += -mcpu=generic+crypto
+endif
 
 benchmark: target/benchmark
 	target/benchmark

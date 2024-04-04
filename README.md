@@ -35,7 +35,7 @@ If the malicious actor has no direct access to the runtime that uses Feijoa and 
 
 ## Usage
 
-Feijoa is a single-header C++17 library (although GCC and Clang compile it in C++11 mode with warnings). It needs to be compiled with `-mpclmul` and only works on x86_64 at the moment, but will be extended to support aarch64.
+Feijoa is a single-header C++17 library (although GCC and Clang compile it in C++11 mode with warnings). It needs to be compiled with `-mpclmul` (on x86_64) or `-mcpu=generic+crypto` (on aarch64). Other architectures are unsupported at the moment.
 
 The library provides a single class `Feijoa` with a static method to construct a new instance of Feijoa with a random seed:
 
