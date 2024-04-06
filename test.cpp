@@ -1,4 +1,4 @@
-#define TRUSTEDHASH_TESTS
+#define FEIJOA_TESTS
 #include "feijoa.hpp"
 #include <cassert>
 

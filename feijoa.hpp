@@ -20,7 +20,7 @@
 #endif
 
 class Feijoa {
-#ifdef TRUSTEDHASH_TESTS
+#ifdef FEIJOA_TESTS
   public:
 #else
   protected:
