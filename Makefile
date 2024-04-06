@@ -1,6 +1,6 @@
 .PHONY: benchmark test format
 
-ARCH := $(shell uname -p)
+ARCH := $(shell uname -m)
 
 CXXOPTS := -O2 -std=c++17 -g -Wall
 ifeq ($(ARCH),x86_64)
