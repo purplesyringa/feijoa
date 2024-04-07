@@ -33,104 +33,72 @@ class Feijoa {
     FEIJOA_VECTOR_TYPE x_512_x_576;
 
     inline uint64_t init_for_basic_computations(uint64_t coeffs) {
-        // Let
-        //     a(x) = x^128 + (p(x) << 64),
-        // then
-        //     x^128 // p(x) + x^64 = a(x) // p(x),
-        //     x^128 mod p(x) = a(x) mod p(x),
-
-        // This is unrolled long division of a(x) by p(x). As a(x) has zero low 64 bits, each
-        // iteration of long division preserves the invariant that only 64 highest bits are
-        // non-zero. This enables us to store these 64 bits in a single 64-bit register acc.
-        // Additionally, the quotient also fits in 64 bits and thus can be stored in a 64-bit
-        // register.
-        uint64_t acc = coeffs;
-        uint64_t quotient = 0;
-
-        // At the first iteration, we consume just one bit of a(x). Consuming the bit shifts acc one
-        // bit to the left, and whether p(x) is added to the accumulator depends on whether the
-        // shifted out bit needs to be zeroed.
-        uint64_t to_xor = acc >> 63 ? coeffs : 0;
-        acc = (acc << 1) ^ to_xor;
-        quotient = (quotient << 1) | (coeffs >> 63);
-
-        // The following 63 iterations are performed in 21 groups of 3. This factor seems to provide
-        // the best performance.
-        //
-        // Here's how the iterations are performed. The goal of long division is to add a factor of
-        // p(x) to the accumulator to ensure some of its leading bits are zeroed. In our
-        // implementation, the goal is to ensure 3 leading bits are zeroed. For instance,
-        // 001[64 bits here] can be zeroed by adding p(x) to the accumulator; in code, this can be
-        // expressed as acc ^= coeffs. However, cancelling e.g. 010[64 bits here] by adding x * p(x)
-        // might fail if p(x) has a coefficient of x^63; indeed, in this case we're left with
-        // 001[64 bits here] instead of 000[64 bits here]. Solving this head-on requires handling
-        // the bits in sequence, which is what we're trying to avoid here, because latency is the
-        // main reason 64 single-bit iterations are slow.
-        //
-        // This is why we shall use another algorithm to determine which factor of p(x) to add.
-        // Determining the coefficients y_0, y_1, y_2 of the factor y_0 + y_1 x + y_2 x^2 is clearly
-        // equivalent to solving the equation
-        //     deg (a(x) x^3 + (y_0 + y_1 x + y_2 x^2) p(x)) < 64,
-        // which is better expressed as a system:
-        //     y_0 + y_1 p[63] + y_2 p[62] = a[61],
-        //     y_1 + y_2 p[63]             = a[62],
-        //     y_2                         = a[63].
-        // The solution is
-        //     y_0 = a[61] + a[62] p[63] + a[63] (p[62] + p[63]),
-        //     y_1 = a[62] + a[63] p[63],
-        //     y_2 = a[63],
-        // i.e. the factor to add is
-        //     (y_0 + y_1 x + y_2 x^2) p(x) = (
-        //         a[61] p(x)
-        //         + a[62] (p[63] + x) p(x)
-        //         + a[63] (p[62] + p[63] + p[63] x + x^2) p(x)
-        //     ).
-        // The important part is that this formula is linear in respect to (a[61], a[62], a[63]),
-        // and if we precompute the factors
-        //     p(x),
-        //     (p[63] + x) p(x),
-        //     (p[62] + p[63] + p[63] x + x^2) p(x)
-        // just once, each iteration can be performed easily. We only care about the factor
-        // (mod x^64), so let us define
-        //     k2(x) = p(x) mod x^64,
-        //     k1(x) = (p[63] + x) p(x) mod x^64,
-        //     k0(x) = (p[62] + p[63] + p[63] x + x^2) p(x) mod x^64.
-        // These are computed as follows:
-        uint64_t k2 = coeffs;
-        uint64_t k1 = coeffs << 1;
-        k1 ^= coeffs >> 63 ? k2 : 0;
-        uint64_t k0 = coeffs << 2;
-        k0 ^= coeffs >> 63 ? k1 : 0;
-        k0 ^= (coeffs >> 62) & 1 ? k2 : 0;
-        for (int i = 0; i < 21; i++) {
-            // Each iteration then reduces to simply:
-            uint64_t xor1 = acc >> 63 ? k0 : 0;
-            uint64_t xor2 = (acc >> 62) & 1 ? k1 : 0;
-            uint64_t xor3 = (acc >> 61) & 1 ? k2 : 0;
-            // We avoid computing the real quotient for now, opting to just collect
-            // a[61], a[62], a[63] for now. We'll compute the quotient later with SWAR.
-            quotient = (quotient << 3) | (acc >> 61);
-            acc = (acc << 3) ^ (xor1 ^ xor2 ^ xor3);
+        // We wish to pre-compute x^128 // p(x) for Barrett reduction steps. Unfortunately, we can't
+        // use Barrett reduction itself to compute the value, so we have to resort to something
+        // dumber. Turns out there is an efficient Hensel lifting-like way to compute it anyway.
+        auto zero_coeffs = polynomial_pair(0, coeffs);
+        // We shall maintain the invariant that at the end of i'th iteration,
+        //     deg(p(x) * q(x) + x^128) <= 128 - 2^(i+1).
+        // Originally, we choose
+        //     q(x) = p(x).
+        // Indeed, p^2(x) contains only even powers up to 128, so p^2(x) + x^128 contains powers
+        // only up to 126. This means we have effectively completed the 0'th iteration.
+        // Note that for ease of implementation, we store q(x) + x^64 instead of q(x) itself.
+        auto garbage_q = zero_coeffs;
+        for (int i = 1; i < 6; i++) {
+            // On the i'th iteration, we compute
+            //     q'(x) = (q^2(x) // x^64) * p(x) // x^64.
+            // We shall show that
+            //     deg(p(x) * q(x) + x^128) <= 128 - 2^(i+1)
+            // implies
+            //     deg(p(x) * q'(x) + x^128) <= 128 - 2^(i+2).
+            // Indeed,
+            //     q'(x) = ((q^2(x) + a(x)) / x^64 * p(x) + b(x)) / x^64,
+            // where deg a(x), deg b(x) < 64. This implies
+            //     p(x) * q'(x) = (p(x) * q(x))^2 / x^128 + c(x)
+            // where deg c(x) < 64, i.e.
+            //     p(x) * q'(x) = (p(x) * q(x))^2 // x^128.
+            // Therefore,
+            //     p(x) * q'(x) + x^128 = (p(x) * q(x) + x^128)^2 // x^128,
+            // hence
+            //     deg(p(x) * q'(x) + x^128) = 2 deg(p(x) * q(x) + x^128) - 128
+            //         <= 2 * (128 - 2^(i+1)) - 128 = 128 - 2^(i+2),
+            // QED.
+            // As for computation,
+            //     u(x) = (q(x) + x^64)^2 // x^64 = q^2(x) // x^64 + x^64
+            auto garbage_u = polynomial_multiply_high(garbage_q, garbage_q);
+            //     q'(x) + x^64 = u(x) * (p(x) + x^64) // x^64 + u(x) + (p(x) + x^64)
+            //         = (u(x) + x^64) * p(x) // x^64 + x^64
+            //         = (q^2(x) // x^64) * p(x) // x^64 + x^64.
+            garbage_q = polynomial_add(polynomial_multiply_high(garbage_u, zero_coeffs),
+                                       polynomial_add(garbage_u, zero_coeffs));
         }
-        // The only difficult part left is to restore the quotient. This amounts to computing the
-        // factors (y_2, y_1, y_0) given (a[63], a[62], a[61]). The simplest way is to use the
-        // sequence
-        //     y_2 = a[63],
-        //     y_1 = a[62] + y_2 p[63],
-        //     y_0 = a[61] + y_1 p[63] + y_2 p[62]
-        // to transform
-        //     t(x) = y_2 x^2 + a[62] x + a[61]
-        // via
-        //     t'(x) = t(x) + t[2] (p[63] x + p[62]) = y_2 x^2 + y_1 x + a[61] + y_2 p[62]
-        // to
-        //     t''(x) = t'(x) + t'[1] p[63] = y_2 x^2 + y_1 x + y_0.
-        // These transformations can be trivially applied to all 21 groups at once via SWAR.
-        quotient ^= ((quotient >> 2) & 0x1249249249249249) * (coeffs >> 62);
-        quotient ^= ((quotient >> 1) & 0x1249249249249249) * (coeffs >> 63);
+        // After the 5'th iteration,
+        //     deg(p(x) * q(x) + x^128) <= 64.
+        // This means that either
+        //     deg(p(x) * q(x) + x^128) < 64
+        //         => q(x) = x^128 // p(x),
+        // or
+        //     deg(p(x) * q(x) + x^128) = 64
+        //         => deg(p(x) * (q(x) + 1) + x^128) < 64
+        //         => q(x) + 1 = x^128 // p(x).
+        // We determine the correct free coefficient by comparing the coefficient at x^64 of
+        // p(x) * q(x) to 1. Computationally,
+        //     v(x) = (q(x) + x^64) * (p(x) + x^64) // x^64 + (q(x) + x^64) + (p(x) + x^64)
+        //         = q(x) * p(x) // x^64 + x^64,
+        // thus the coefficient that determines whether q(x) is to be incremented is the free
+        // coefficient of v(x).
+        auto garbage_v = polynomial_add(polynomial_multiply_high(garbage_q, zero_coeffs),
+                                        polynomial_add(garbage_q, zero_coeffs));
+        auto garbage_quotient =
+            polynomial_add(garbage_q, polynomial_and(garbage_v, polynomial_pair(0, 1)));
 
-        low_p_low_x_128_div_p = polynomial_pair(coeffs, quotient);
+        low_p_low_x_128_div_p = polynomial_pair(coeffs, polynomial_high(garbage_quotient));
 
-        uint64_t x_128 = acc;
+        // We wish to compute x^128 % p(x). We already know what x^128 // p(x) equals, so compute
+        //     x^128 % p(x) = x^128 + x^128 // p(x) * p(x) = (x^128 // p(x) * p(x)) mod x^64
+        uint64_t x_128 = polynomial_low(polynomial_multiply_high(garbage_quotient, zero_coeffs));
+
         uint64_t x_192 = reduce(polynomial_pair(0, x_128));
         x_128_x_192 = polynomial_pair(x_128, x_192);
         return x_128;
@@ -191,11 +159,28 @@ class Feijoa {
 #endif
     }
 
+    static inline FEIJOA_VECTOR_TYPE polynomial_and(FEIJOA_VECTOR_TYPE a, FEIJOA_VECTOR_TYPE b) {
+#ifdef __x86_64__
+        return _mm_and_si128(a, b);
+#else
+        return vreinterpretq_p64_u64(vandq_u64(vreinterpretq_u64_p64(a), vreinterpretq_u64_p64(b)));
+#endif
+    }
+
     static inline uint64_t polynomial_low(FEIJOA_VECTOR_TYPE a) {
 #ifdef __x86_64__
         return _mm_cvtsi128_si64(a);
 #else
         return vgetq_lane_u64(vreinterpretq_u64_p64(a), 0);
+#endif
+    }
+
+    static inline uint64_t polynomial_high(FEIJOA_VECTOR_TYPE a) {
+#ifdef __x86_64__
+        // Compiles to movhlps + movq or to pextrq depending on presence of SSE 4.1.
+        return a[1];
+#else
+        return vgetq_lane_u64(vreinterpretq_u64_p64(a), 1);
 #endif
     }
 
