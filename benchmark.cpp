@@ -12,7 +12,7 @@ int main() {
     start = clock();
     for (int i = 0; i < 100000; i++) {
         Feijoa feijoa = Feijoa::random(generator);
-        asm volatile("" : : "m"(feijoa));
+        asm volatile("" : : "g"(feijoa));
     }
     fprintf(stderr, "Initialization: %ldk instances/s\n",
             100L * CLOCKS_PER_SEC / (clock() - start));
@@ -20,7 +20,7 @@ int main() {
     start = clock();
     for (int i = 0; i < 100000; i++) {
         auto feijoas = Feijoa::random_many<3>(generator);
-        asm volatile("" : : "m"(feijoas));
+        asm volatile("" : : "g"(feijoas));
     }
     fprintf(stderr, "Initialization of 3 Feijoas: 3*%ldk instances/s\n",
             100L * CLOCKS_PER_SEC / (clock() - start));
@@ -31,7 +31,7 @@ int main() {
     start = clock();
     for (int i = 0; i < 1000000; i++) {
         uint64_t hash = feijoa.reduce(page.data(), page.size());
-        asm volatile("" : : "x"(hash) : "memory");
+        asm volatile("" : : "g"(hash) : "memory");
     }
     fprintf(stderr, "Hashing: %.1f GiB/s\n",
             4096. * 1000000 / 1024 / 1024 / 1024 * CLOCKS_PER_SEC / (clock() - start));
