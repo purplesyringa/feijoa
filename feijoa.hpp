@@ -11,12 +11,10 @@
 
 #ifdef __x86_64__
 #include <immintrin.h>
-#define FEIJOA_VECTOR_TYPE __m128i
-#endif
-
-#ifdef __aarch64__
+#elif defined(__aarch64__)
 #include <arm_neon.h>
-#define FEIJOA_VECTOR_TYPE poly64x2_t
+#else
+#error Feijoa is not supported on this architecture.
 #endif
 
 class Feijoa {
@@ -25,18 +23,107 @@ class Feijoa {
 #else
   protected:
 #endif
+    struct Vector {
+        inline Vector() = default;
+
+#ifdef __x86_64__
+        __m128i vector;
+
+        inline explicit Vector(__m128i vector) : vector(vector) {}
+        inline explicit Vector(uint64_t low, uint64_t high) : vector(_mm_set_epi64x(high, low)) {}
+        static inline Vector load_unaligned(const Vector *p) {
+            return Vector{_mm_loadu_si128(reinterpret_cast<const __m128i *>(p))};
+        }
+
+        inline Vector multiply_low(Vector rhs) const {
+            return Vector{_mm_clmulepi64_si128(vector, rhs.vector, 0x00)};
+        }
+        inline Vector multiply_high(Vector rhs) const {
+            return Vector{_mm_clmulepi64_si128(vector, rhs.vector, 0x11)};
+        }
+        inline Vector multiply_low_high(Vector rhs) const {
+            return Vector{_mm_clmulepi64_si128(vector, rhs.vector, 0x10)};
+        }
+
+        inline Vector operator+(Vector rhs) const {
+            return Vector{_mm_xor_si128(vector, rhs.vector)};
+        }
+        inline Vector operator&(Vector rhs) const {
+            return Vector{_mm_and_si128(vector, rhs.vector)};
+        }
+
+        inline uint64_t low() const { return _mm_cvtsi128_si64(vector); }
+        inline uint64_t high() const { return vector[1]; }
+
+        inline Vector set_low(uint64_t low) const {
+            // Compiles to movq + movsd or to pinsrq depending on presence of SSE 4.1.
+            __m128i copy = vector;
+            copy[0] = low;
+            return Vector{copy};
+        }
+
+        inline Vector zero_high() const { return Vector{_mm_move_epi64(vector)}; }
+#else
+        poly64x2_t vector;
+
+        inline explicit Vector(poly64x2_t vector) : vector(vector) {}
+        inline explicit Vector(uint64_t low, uint64_t high)
+            : vector(vcombine_p64(vcreate_p64(low), vcreate_p64(high))) {}
+        static inline Vector load_unaligned(const Vector *p) {
+            return Vector{vreinterpretq_p64_s8(vld1q_s8(reinterpret_cast<const int8_t *>(p)))};
+        }
+
+        inline Vector multiply_low(Vector rhs) const {
+            Vector result;
+            asm("pmull %0.1q, %1.1d, %2.1d" : "=w"(result.vector) : "w"(vector), "w"(rhs.vector));
+            return result;
+        }
+        inline Vector multiply_high(Vector rhs) const {
+            Vector result;
+            asm("pmull2 %0.1q, %1.2d, %2.2d" : "=w"(result.vector) : "w"(vector), "w"(rhs.vector));
+            return result;
+        }
+        inline Vector multiply_low_high(Vector rhs) const {
+            return Vector{vdupq_laneq_p64(vector, 0)}.multiply_high(rhs);
+        }
+
+        inline Vector operator+(Vector rhs) const { return Vector{vaddq_p64(vector, rhs.vector)}; }
+        inline Vector operator&(Vector rhs) const {
+            return Vector{vreinterpretq_p64_u64(
+                vandq_u64(vreinterpretq_u64_p64(vector), vreinterpretq_u64_p64(rhs.vector)))};
+        }
+
+        inline uint64_t low() const { return vgetq_lane_u64(vreinterpretq_u64_p64(vector), 0); }
+        inline uint64_t high() const { return vgetq_lane_u64(vreinterpretq_u64_p64(vector), 1); }
+
+        inline Vector set_low(uint64_t low) const {
+            return Vector{vsetq_lane_p64(low, vector, 0)};
+        }
+
+        inline Vector zero_high() const { return Vector{vsetq_lane_p64(0, vector, 1)}; }
+#endif
+    };
+
+    static inline bool has_pdep() {
+#ifdef __x86_64__
+        return __builtin_cpu_supports("bmi2");
+#else
+        return false;
+#endif
+    }
+
     // Low half stores p(x) + x^64, high half stores x^128 // p(x) + x^64.
-    FEIJOA_VECTOR_TYPE low_p_low_x_128_div_p;
+    Vector low_p_low_x_128_div_p;
     // Low half stores x^128 mod p(x), high half stores x^192 mod p(x).
-    FEIJOA_VECTOR_TYPE x_128_x_192;
+    Vector x_128_x_192;
     // Low half stores x^512 mod p(x), high half stores x^576 mod p(x).
-    FEIJOA_VECTOR_TYPE x_512_x_576;
+    Vector x_512_x_576;
 
     inline uint64_t init_for_basic_computations(uint64_t coeffs) {
         // We wish to pre-compute x^128 // p(x) for Barrett reduction steps. Unfortunately, we can't
         // use Barrett reduction itself to compute the value, so we have to resort to something
         // dumber. Turns out there is an efficient Hensel lifting-like way to compute it anyway.
-        auto zero_coeffs = polynomial_pair(0, coeffs);
+        Vector zero_coeffs{0, coeffs};
         // We shall maintain the invariant that at the end of i'th iteration,
         //     deg(p(x) * q(x) + x^128) <= 128 - 2^(i+1).
         // Originally, we choose
@@ -66,12 +153,11 @@ class Feijoa {
             // QED.
             // As for computation,
             //     u(x) = (q(x) + x^64)^2 // x^64 = q^2(x) // x^64 + x^64
-            auto garbage_u = polynomial_multiply_high(garbage_q, garbage_q);
+            auto garbage_u = garbage_q.multiply_high(garbage_q);
             //     q'(x) + x^64 = u(x) * (p(x) + x^64) // x^64 + u(x) + (p(x) + x^64)
             //         = (u(x) + x^64) * p(x) // x^64 + x^64
             //         = (q^2(x) // x^64) * p(x) // x^64 + x^64.
-            garbage_q = polynomial_add(polynomial_multiply_high(garbage_u, zero_coeffs),
-                                       polynomial_add(garbage_u, zero_coeffs));
+            garbage_q = garbage_u.multiply_high(zero_coeffs) + (garbage_u + zero_coeffs);
         }
         // After the 5'th iteration,
         //     deg(p(x) * q(x) + x^128) <= 64.
@@ -88,123 +174,25 @@ class Feijoa {
         //         = q(x) * p(x) // x^64 + x^64,
         // thus the coefficient that determines whether q(x) is to be incremented is the free
         // coefficient of v(x).
-        auto garbage_v = polynomial_add(polynomial_multiply_high(garbage_q, zero_coeffs),
-                                        polynomial_add(garbage_q, zero_coeffs));
-        auto garbage_quotient =
-            polynomial_add(garbage_q, polynomial_and(garbage_v, polynomial_pair(0, 1)));
+        auto garbage_v = garbage_q.multiply_high(zero_coeffs) + (garbage_q + zero_coeffs);
+        auto garbage_quotient = garbage_q + (garbage_v & Vector{0, 1});
 
-        low_p_low_x_128_div_p = polynomial_pair(coeffs, polynomial_high(garbage_quotient));
+        low_p_low_x_128_div_p = garbage_quotient.set_low(coeffs);
 
         // We wish to compute x^128 % p(x). We already know what x^128 // p(x) equals, so compute
         //     x^128 % p(x) = x^128 + x^128 // p(x) * p(x) = (x^128 // p(x) * p(x)) mod x^64
-        uint64_t x_128 = polynomial_low(polynomial_multiply_high(garbage_quotient, zero_coeffs));
+        uint64_t x_128 = garbage_quotient.multiply_high(zero_coeffs).low();
 
-        uint64_t x_192 = reduce(polynomial_pair(0, x_128));
-        x_128_x_192 = polynomial_pair(x_128, x_192);
+        uint64_t x_192 = reduce(Vector{0, x_128});
+        x_128_x_192 = Vector{x_128, x_192};
         return x_128;
-    }
-
-    static inline FEIJOA_VECTOR_TYPE polynomial_pair(uint64_t low, uint64_t high) {
-#ifdef __x86_64__
-        return _mm_set_epi64x(high, low);
-#else
-        return vcombine_p64(vcreate_p64(low), vcreate_p64(high));
-#endif
-    }
-
-    static inline FEIJOA_VECTOR_TYPE polynomial_load_unaligned(const FEIJOA_VECTOR_TYPE *p) {
-#ifdef __x86_64__
-        return _mm_loadu_si128(p);
-#else
-        return vreinterpretq_p64_s8(vld1q_s8(reinterpret_cast<const int8_t *>(p)));
-#endif
-    }
-
-    static inline FEIJOA_VECTOR_TYPE polynomial_multiply_low(FEIJOA_VECTOR_TYPE a,
-                                                             FEIJOA_VECTOR_TYPE b) {
-#ifdef __x86_64__
-        return _mm_clmulepi64_si128(a, b, 0x00);
-#else
-        poly64x2_t result;
-        asm("pmull %0.1q, %1.1d, %2.1d" : "=w"(result) : "w"(a), "w"(b));
-        return result;
-#endif
-    }
-
-    static inline FEIJOA_VECTOR_TYPE polynomial_multiply_high(FEIJOA_VECTOR_TYPE a,
-                                                              FEIJOA_VECTOR_TYPE b) {
-#ifdef __x86_64__
-        return _mm_clmulepi64_si128(a, b, 0x11);
-#else
-        poly64x2_t result;
-        asm("pmull2 %0.1q, %1.2d, %2.2d" : "=w"(result) : "w"(a), "w"(b));
-        return result;
-#endif
-    }
-
-    static inline FEIJOA_VECTOR_TYPE polynomial_multiply_low_high(FEIJOA_VECTOR_TYPE a,
-                                                                  FEIJOA_VECTOR_TYPE b) {
-#ifdef __x86_64__
-        return _mm_clmulepi64_si128(a, b, 0x10);
-#else
-        return polynomial_multiply_high(vdupq_laneq_p64(a, 0), b);
-#endif
-    }
-
-    static inline FEIJOA_VECTOR_TYPE polynomial_add(FEIJOA_VECTOR_TYPE a, FEIJOA_VECTOR_TYPE b) {
-#ifdef __x86_64__
-        return _mm_xor_si128(a, b);
-#else
-        return vaddq_p64(a, b);
-#endif
-    }
-
-    static inline FEIJOA_VECTOR_TYPE polynomial_and(FEIJOA_VECTOR_TYPE a, FEIJOA_VECTOR_TYPE b) {
-#ifdef __x86_64__
-        return _mm_and_si128(a, b);
-#else
-        return vreinterpretq_p64_u64(vandq_u64(vreinterpretq_u64_p64(a), vreinterpretq_u64_p64(b)));
-#endif
-    }
-
-    static inline uint64_t polynomial_low(FEIJOA_VECTOR_TYPE a) {
-#ifdef __x86_64__
-        return _mm_cvtsi128_si64(a);
-#else
-        return vgetq_lane_u64(vreinterpretq_u64_p64(a), 0);
-#endif
-    }
-
-    static inline uint64_t polynomial_high(FEIJOA_VECTOR_TYPE a) {
-#ifdef __x86_64__
-        // Compiles to movhlps + movq or to pextrq depending on presence of SSE 4.1.
-        return a[1];
-#else
-        return vgetq_lane_u64(vreinterpretq_u64_p64(a), 1);
-#endif
-    }
-
-    static inline FEIJOA_VECTOR_TYPE polynomial_zero_high(FEIJOA_VECTOR_TYPE a) {
-#ifdef __x86_64__
-        return _mm_move_epi64(a);
-#else
-        return vsetq_lane_p64(0, a, 1);
-#endif
-    }
-
-    static inline bool has_pdep() {
-#ifdef __x86_64__
-        return __builtin_cpu_supports("bmi2");
-#else
-        return false;
-#endif
     }
 
     inline void init_for_hashing(uint64_t x_128) {
         auto x_256 = square(x_128);
         uint64_t x_512 = reduce(square(x_256));
-        uint64_t x_576 = reduce(polynomial_pair(0, x_512));
-        x_512_x_576 = polynomial_pair(x_512, x_576);
+        uint64_t x_576 = reduce(Vector{0, x_512});
+        x_512_x_576 = Vector{x_512, x_576};
     }
 
     // Generates a random irreducible polynomial of degree 64 using the given random bit generator.
@@ -246,55 +234,52 @@ class Feijoa {
     }
 
     // Given a(x), computes a representative of a(x)^2 (mod p(x)).
-    inline FEIJOA_VECTOR_TYPE square(FEIJOA_VECTOR_TYPE a) const {
+    inline Vector square(Vector a) const {
         // In F_2,
         //     ((high << 64) + low)^2 = (high^2 << 128) + low^2.
-        return polynomial_add(shift_128(polynomial_multiply_high(a, a)),
-                              polynomial_multiply_low(a, a));
+        return shift_128(a.multiply_high(a)) + a.multiply_low(a);
     }
 
     // Given a(x), computes a representative of a(x)^2 (mod p(x)).
-    template <typename UsePdep> FEIJOA_VECTOR_TYPE square(uint64_t a, UsePdep use_pdep) const {
+    template <typename UsePdep> Vector square(uint64_t a, UsePdep use_pdep) const {
         if constexpr (use_pdep) {
 #ifdef __x86_64__
             uint64_t high, low;
             asm("pdep %1, %2, %0" : "=r"(high) : "r"(0x5555555555555555), "r"(a >> 32));
             asm("pdep %1, %2, %0" : "=r"(low) : "r"(0x5555555555555555), "r"(a));
-            return polynomial_pair(low, high);
+            return Vector{low, high};
 #else
             __builtin_trap();
 #endif
         } else {
-            auto a_vec = polynomial_pair(a, 0);
-            return polynomial_multiply_low(a_vec, a_vec);
+            Vector a_vec{a, 0};
+            return a_vec.multiply_low(a_vec);
         }
     }
 
     // Given a(x), computes a representative of a(x)^2 (mod p(x)).
-    inline FEIJOA_VECTOR_TYPE square(uint64_t a) const { return square(a, std::false_type{}); }
+    inline Vector square(uint64_t a) const { return square(a, std::false_type{}); }
 
     // Given a(x), computes a representative of a(x) * x^128 (mod p(x)).
-    inline FEIJOA_VECTOR_TYPE shift_128(FEIJOA_VECTOR_TYPE a) const {
+    inline Vector shift_128(Vector a) const {
         // In F_2,
         //     ((high << 64) + low) << 128 = (high << 192) + (low << 128),
         // hence
         //     a << 128 = high * ((1 << 192) mod p(x)) + low * ((1 << 128) mod p(x)) (mod p(x)).
-        return polynomial_add(polynomial_multiply_low(a, x_128_x_192),
-                              polynomial_multiply_high(a, x_128_x_192));
+        return a.multiply_low(x_128_x_192) + a.multiply_high(x_128_x_192);
     }
 
     // Given a(x), computes a representative of a(x) * x^512 (mod p(x)).
-    inline FEIJOA_VECTOR_TYPE shift_512(FEIJOA_VECTOR_TYPE a) const {
+    inline Vector shift_512(Vector a) const {
         // In F_2,
         //     ((high << 64) + low) << 512 = (high << 576) + (low << 512),
         // hence
         //     a << 512 = high * ((1 << 576) mod p(x)) + low * ((1 << 512) mod p(x)) (mod p(x)).
-        return polynomial_add(polynomial_multiply_low(a, x_512_x_576),
-                              polynomial_multiply_high(a, x_512_x_576));
+        return a.multiply_low(x_512_x_576) + a.multiply_high(x_512_x_576);
     }
 
     // Given a(x), computes a(x) mod p(x).
-    inline uint64_t reduce(FEIJOA_VECTOR_TYPE a) const {
+    inline uint64_t reduce(Vector a) const {
         // a(x) mod p(x) = ((high << 64) + low) mod p(x) = (high << 64) mod p(x) + low.
 
         // Perform Barrett reduction on (high << 64): we shall compute
@@ -310,12 +295,11 @@ class Feijoa {
         // which implies
         //     q(x) + q'(x) = A(x) / p(x) + (high * B(x) / p(x) + C(x)) / x^64,
         // which is a ratio of a negative degree but also a polynomial, i.e. 0.
-        auto garbage_q = polynomial_add(a, polynomial_multiply_high(a, low_p_low_x_128_div_p));
+        auto garbage_q = a + a.multiply_high(low_p_low_x_128_div_p);
 
         // Compute the low 64 bits of
         //     a(x) mod p(x) = a(x) + q(x) * p(x).
-        return polynomial_low(
-            polynomial_add(a, polynomial_multiply_low_high(low_p_low_x_128_div_p, garbage_q)));
+        return (a + low_p_low_x_128_div_p.multiply_low_high(garbage_q)).low();
     }
 
     // p(x) of degree d is irreducible over F_2 iff:
@@ -331,14 +315,7 @@ class Feijoa {
     template <size_t N, typename UsePdep>
     static std::array<std::pair<bool, uint64_t>, N>
     is_quasi_irreducible_parallel(const std::array<Feijoa, N> &feijoas, UsePdep use_pdep) {
-        // Wrap __m128i in a struct so that the template argument of std::conditional_t does not
-        // have attributes that would be dropped, e.g. alignment. See:
-        // - https://gcc.gnu.org/bugzilla/show_bug.cgi?id=97222
-        // - https://bugs.llvm.org/show_bug.cgi?id=47674
-        struct wrapped_vector_t {
-            FEIJOA_VECTOR_TYPE wrapped;
-        };
-        using element_type = typename std::conditional<use_pdep, uint64_t, wrapped_vector_t>::type;
+        using element_type = typename std::conditional<use_pdep, uint64_t, Vector>::type;
 
         element_type x_2_32[N];
 
@@ -347,9 +324,9 @@ class Feijoa {
         // Initialize with x^(2^7) mod p(x).
         for (size_t i = 0; i < N; i++) {
             if constexpr (use_pdep) {
-                x_2_32[i] = polynomial_low(feijoas[i].x_128_x_192);
+                x_2_32[i] = feijoas[i].x_128_x_192.low();
             } else {
-                x_2_32[i].wrapped = polynomial_zero_high(feijoas[i].x_128_x_192);
+                x_2_32[i] = feijoas[i].x_128_x_192.zero_high();
             }
         }
 
@@ -358,7 +335,7 @@ class Feijoa {
                 if constexpr (use_pdep) {
                     x_2_32[i] = feijoas[i].reduce(feijoas[i].square(x_2_32[i], use_pdep));
                 } else {
-                    x_2_32[i].wrapped = feijoas[i].square(x_2_32[i].wrapped);
+                    x_2_32[i] = feijoas[i].square(x_2_32[i]);
                 }
             }
         }
@@ -373,7 +350,7 @@ class Feijoa {
                 if constexpr (use_pdep) {
                     x_2_64[i] = feijoas[i].reduce(feijoas[i].square(x_2_64[i], use_pdep));
                 } else {
-                    x_2_64[i].wrapped = feijoas[i].square(x_2_64[i].wrapped);
+                    x_2_64[i] = feijoas[i].square(x_2_64[i]);
                 }
             }
         }
@@ -384,8 +361,8 @@ class Feijoa {
             if constexpr (use_pdep) {
                 results[i] = {x_2_64[i] == 2, x_2_32[i]};
             } else {
-                bool success = feijoas[i].reduce(x_2_64[i].wrapped) == 2;
-                results[i] = {success, success ? feijoas[i].reduce(x_2_32[i].wrapped) : 0};
+                bool success = feijoas[i].reduce(x_2_64[i]) == 2;
+                results[i] = {success, success ? feijoas[i].reduce(x_2_32[i]) : 0};
             }
         }
         return results;
@@ -506,7 +483,7 @@ class Feijoa {
     }
 
     // Returns a seed that can be used to restore the Feijoa instance later.
-    inline uint64_t get_seed() const { return polynomial_low(low_p_low_x_128_div_p); }
+    inline uint64_t get_seed() const { return low_p_low_x_128_div_p.low(); }
 
     // Computes the hash of an array whose length is a product of 16.
     inline uint64_t reduce(const char *data, size_t n) const {
@@ -523,28 +500,28 @@ class Feijoa {
         // guarantee if deg a(x) < 64. Using a power lower than 64 would break it for n = 0, which
         // is perhaps not a bad thing, really, but using 64 is free so why not.
 
-        auto casted = reinterpret_cast<const FEIJOA_VECTOR_TYPE *>(data);
+        auto casted = reinterpret_cast<const Vector *>(data);
 
         size_t i = 0;
 
-        auto acc3 = polynomial_pair(0, 0);
-        auto acc2 = polynomial_pair(0, 0);
-        auto acc1 = polynomial_pair(0, 0);
-        auto acc0 = polynomial_pair(0, 1);
+        Vector acc3{0, 0};
+        Vector acc2{0, 0};
+        Vector acc1{0, 0};
+        Vector acc0{0, 1};
         while (i + 64 <= n) {
-            acc3 = polynomial_add(shift_512(acc3), polynomial_load_unaligned(casted + i / 16));
-            acc2 = polynomial_add(shift_512(acc2), polynomial_load_unaligned(casted + i / 16 + 1));
-            acc1 = polynomial_add(shift_512(acc1), polynomial_load_unaligned(casted + i / 16 + 2));
-            acc0 = polynomial_add(shift_512(acc0), polynomial_load_unaligned(casted + i / 16 + 3));
+            acc3 = shift_512(acc3) + Vector::load_unaligned(casted + i / 16);
+            acc2 = shift_512(acc2) + Vector::load_unaligned(casted + i / 16 + 1);
+            acc1 = shift_512(acc1) + Vector::load_unaligned(casted + i / 16 + 2);
+            acc0 = shift_512(acc0) + Vector::load_unaligned(casted + i / 16 + 3);
             i += 64;
         }
         auto acc = acc3;
-        acc = polynomial_add(shift_128(acc), acc2);
-        acc = polynomial_add(shift_128(acc), acc1);
-        acc = polynomial_add(shift_128(acc), acc0);
+        acc = shift_128(acc) + acc2;
+        acc = shift_128(acc) + acc1;
+        acc = shift_128(acc) + acc0;
 
         while (i + 16 <= n) {
-            acc = polynomial_add(shift_128(acc), polynomial_load_unaligned(casted + i / 16));
+            acc = shift_128(acc) + Vector::load_unaligned(casted + i / 16);
             i += 16;
         }
 
