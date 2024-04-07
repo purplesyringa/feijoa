@@ -96,17 +96,18 @@ class Feijoa {
         inline uint64_t low() const { return vgetq_lane_u64(vreinterpretq_u64_p64(vector), 0); }
         inline uint64_t high() const { return vgetq_lane_u64(vreinterpretq_u64_p64(vector), 1); }
 
-        inline Vector set_low(uint64_t low) const {
-            return Vector{vsetq_lane_p64(low, vector, 0)};
-        }
+        inline Vector set_low(uint64_t low) const { return Vector{vsetq_lane_p64(low, vector, 0)}; }
 
         inline Vector zero_high() const { return Vector{vsetq_lane_p64(0, vector, 1)}; }
 #endif
     };
 
-    static inline bool has_pdep() {
+    static inline bool should_use_pdep() {
 #ifdef __x86_64__
-        return __builtin_cpu_supports("bmi2");
+        // AMD processors before Zen 3 have inefficient microcoded pdep.
+        return __builtin_cpu_supports("bmi2") &&
+               !(__builtin_cpu_is("amdfam15h") || __builtin_cpu_is("znver1") ||
+                 __builtin_cpu_is("znver2"));
 #else
         return false;
 #endif
@@ -376,7 +377,7 @@ class Feijoa {
 
     // Tests if p(x) is quasi-irreducible.
     inline std::pair<bool, uint64_t> is_quasi_irreducible() const {
-        if (has_pdep()) {
+        if (should_use_pdep()) {
             return is_quasi_irreducible(std::true_type{});
         } else {
             return is_quasi_irreducible(std::false_type{});
@@ -431,7 +432,7 @@ class Feijoa {
 
     // Generates a random irreducible polynomial of degree 64 using the given random bit generator.
     template <typename Generator> static Feijoa random(Generator &generator) {
-        if (has_pdep()) {
+        if (should_use_pdep()) {
             return random(generator, std::true_type{});
         } else {
             return random(generator, std::false_type{});
@@ -475,7 +476,7 @@ class Feijoa {
 
     // Tests if p(x) is irreducible.
     inline bool is_irreducible() const {
-        if (has_pdep()) {
+        if (should_use_pdep()) {
             return is_irreducible(std::true_type{});
         } else {
             return is_irreducible(std::false_type{});
