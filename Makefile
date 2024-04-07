@@ -10,6 +10,9 @@ ifeq ($(ARCH),aarch64)
 CXXOPTS += -mcpu=generic+crypto
 endif
 
+all:
+	echo "This Makefile is not supposed to be used for builds."
+
 benchmark: target/benchmark
 	target/benchmark
 target/benchmark: benchmark.cpp feijoa.hpp
