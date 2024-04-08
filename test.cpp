@@ -36,7 +36,7 @@ int main() {
         assert(eq(feijoa.square(Feijoa::Vector{uint64_t{1} << 32, 0}), Feijoa::Vector{0, 1}));
         // (x^64)^2 = 0
         assert(eq(feijoa.square(Feijoa::Vector{0, 1}), Feijoa::Vector{0, 0}));
-        if (Feijoa::has_pdep()) {
+        if (Feijoa::should_use_pdep()) {
             // (x^33 + x^32 + x^2 + 1)^2 = x^66 + x^64 + x^4 + 1
             assert(
                 eq(feijoa.square(0x300000005, std::true_type{}), Feijoa::Vector{0b10001, 0b101}));
@@ -49,7 +49,7 @@ int main() {
         assert(feijoa.reduce(buffer, 0) == 0);
         assert(!feijoa.is_irreducible(std::false_type{}));
         assert(!feijoa.is_quasi_irreducible(std::false_type{}).first);
-        if (Feijoa::has_pdep()) {
+        if (Feijoa::should_use_pdep()) {
             assert(!feijoa.is_irreducible(std::true_type{}));
             assert(!feijoa.is_quasi_irreducible(std::true_type{}).first);
         }
@@ -74,13 +74,13 @@ int main() {
         assert(feijoa.reduce(feijoa.square(a)) == 0x47ff962ca9e606df);
         assert(feijoa.reduce(feijoa.shift_128(a)) == 0x6f010a6522f6d04a);
         assert(feijoa.reduce(feijoa.shift_512(a)) == 0x3c04fde0b1149209);
-        if (Feijoa::has_pdep()) {
+        if (Feijoa::should_use_pdep()) {
             assert(eq(feijoa.square(0xe30d03531263e5f5, std::true_type{}),
                       Feijoa::Vector{0x0104140554115511, 0x5405005100051105}));
         }
         assert(!feijoa.is_irreducible(std::false_type{}));
         assert(!feijoa.is_quasi_irreducible(std::false_type{}).first);
-        if (Feijoa::has_pdep()) {
+        if (Feijoa::should_use_pdep()) {
             assert(!feijoa.is_irreducible(std::true_type{}));
             assert(!feijoa.is_quasi_irreducible(std::true_type{}).first);
         }
@@ -108,13 +108,13 @@ int main() {
         assert(feijoa.reduce(feijoa.square(a)) == 0x9682819ce543af15);
         assert(feijoa.reduce(feijoa.shift_128(a)) == 0x61017f24d3cfdfec);
         assert(feijoa.reduce(feijoa.shift_512(a)) == 0xd4d2d6bc13a5c724);
-        if (Feijoa::has_pdep()) {
+        if (Feijoa::should_use_pdep()) {
             assert(eq(feijoa.square(0xc78c0896c394c3cf, std::true_type{}),
                       Feijoa::Vector{0x5005411050055055, 0x5015405000404114}));
         }
         assert(feijoa.is_irreducible(std::false_type{}));
         assert(feijoa.is_quasi_irreducible(std::false_type{}).first);
-        if (Feijoa::has_pdep()) {
+        if (Feijoa::should_use_pdep()) {
             assert(feijoa.is_irreducible(std::true_type{}));
             assert(feijoa.is_quasi_irreducible(std::true_type{}).first);
         }
@@ -135,7 +135,7 @@ int main() {
         Feijoa feijoa{0x6309003840f9283f};
         assert(!feijoa.is_irreducible(std::false_type{}));
         assert(feijoa.is_quasi_irreducible(std::false_type{}).first);
-        if (Feijoa::has_pdep()) {
+        if (Feijoa::should_use_pdep()) {
             assert(!feijoa.is_irreducible(std::true_type{}));
             assert(feijoa.is_quasi_irreducible(std::true_type{}).first);
         }
@@ -143,7 +143,7 @@ int main() {
 
     std::mt19937_64 generator{0};
     assert(Feijoa::random(generator, std::false_type{}).is_irreducible());
-    if (Feijoa::has_pdep()) {
+    if (Feijoa::should_use_pdep()) {
         assert(Feijoa::random(generator, std::true_type{}).is_irreducible());
     }
 
