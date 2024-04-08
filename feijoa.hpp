@@ -210,8 +210,8 @@ class Feijoa {
             // the current performance of Feijoa::Feijoa and is_quasi_irreducible_parallel,
             // depending on whether BMI2 is available.
 
-            std::array<Feijoa, use_pdep ? 6 : 4> feijoas;
-            std::array<uint64_t, use_pdep ? 6 : 4> x_128;
+            std::array<Feijoa, use_pdep ? 6 : 3> feijoas;
+            std::array<uint64_t, feijoas.size()> x_128;
             for (size_t i = 0; i < feijoas.size(); i++) {
                 x_128[i] = feijoas[i].init_for_basic_computations(fixup_coprime(rng(generator)));
             }
