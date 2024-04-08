@@ -190,7 +190,7 @@ class Feijoa {
     }
 
     inline void init_for_hashing(uint64_t x_128) {
-        auto x_256 = square(x_128);
+        auto x_256 = square(x_128, std::false_type{});
         uint64_t x_512 = reduce(square(x_256));
         uint64_t x_576 = reduce(Vector{0, x_512});
         x_512_x_576 = Vector{x_512, x_576};
@@ -257,9 +257,6 @@ class Feijoa {
             return a_vec.multiply_low(a_vec);
         }
     }
-
-    // Given a(x), computes a representative of a(x)^2 (mod p(x)).
-    inline Vector square(uint64_t a) const { return square(a, std::false_type{}); }
 
     // Given a(x), computes a representative of a(x) * x^128 (mod p(x)).
     inline Vector shift_128(Vector a) const {
