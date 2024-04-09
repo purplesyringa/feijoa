@@ -470,8 +470,8 @@ class Feijoa {
         return shift_128(a.multiply_high(a)) + a.multiply_low(a);
     }
 
-    // Given a(x), computes a representative of a(x)^2 (mod p(x)).
-    template <typename UsePdep> Vector square(uint64_t a, UsePdep use_pdep) const {
+    // Given a(x), computes a(x)^2.
+    template <typename UsePdep> static Vector square(uint64_t a, UsePdep use_pdep) {
         if constexpr (use_pdep) {
 #ifdef __x86_64__
             uint64_t high, low;
