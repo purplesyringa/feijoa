@@ -4,6 +4,19 @@
 
 bool eq(Feijoa::Vector a, Feijoa::Vector b) { return a.low() == b.low() && a.high() == b.high(); }
 
+#ifdef __x86_64__
+#define ASSERT_IF_PDEP(...)                                                                        \
+    do {                                                                                           \
+        if (Feijoa::RepeatedlySquarablePdep::is_available()) {                                     \
+            assert(__VA_ARGS__);                                                                   \
+        }                                                                                          \
+    } while (false)
+#else
+#define ASSERT_IF_PDEP(...)                                                                        \
+    do {                                                                                           \
+    } while (false)
+#endif
+
 int main() {
     char buffer[] =
         "\x66\xcb\xe4\x6c\x1c\x17\xf6\xb3\x75\x20\x79\x09\x0c\xa9\x0f\xed\xcd\x18\xc4\xc1\x82\xc3"
@@ -28,24 +41,20 @@ int main() {
         assert(eq(feijoa.square(Feijoa::Vector{uint64_t{1} << 32, 0}), Feijoa::Vector{0, 1}));
         // (x^64)^2 = 0
         assert(eq(feijoa.square(Feijoa::Vector{0, 1}), Feijoa::Vector{0, 0}));
-        // (x^33 + x^32 + x^2 + 1)^2 = x^66 + x^64 + x^4 + 1
-        assert(eq(Feijoa::square(0x300000005, std::false_type{}), Feijoa::Vector{0b10001, 0b101}));
-        if (Feijoa::should_use_pdep()) {
-            assert(
-                eq(Feijoa::square(0x300000005, std::true_type{}), Feijoa::Vector{0b10001, 0b101}));
-        }
+        // (x^33 + x^32 + x^2 + 1)^2 mod x^64 = x^4 + 1
+        assert((Feijoa::RepeatedlySquarableClmul{feijoa, 0x300000005}.squared().reduced() == 0x11));
+        ASSERT_IF_PDEP(
+            (Feijoa::RepeatedlySquarablePdep{feijoa, 0x300000005}.squared().reduced() == 0x11));
         assert(eq(feijoa.shift_128(Feijoa::Vector{123, 456}), Feijoa::Vector{0, 0}));
         assert(eq(feijoa.shift_512(Feijoa::Vector{123, 456}), Feijoa::Vector{0, 0}));
         assert(feijoa.reduce(Feijoa::Vector{123, 456}) == 123);
         assert(feijoa.reduce(buffer, 64) == 0x8efa2cf5c129e18d);
         assert(feijoa.reduce(buffer + 16, 48) == 0x8efa2cf5c129e18d);
         assert(feijoa.reduce(buffer, 0) == 0);
-        assert(!feijoa.is_irreducible(std::false_type{}));
-        assert(!feijoa.is_quasi_irreducible(std::false_type{}).first);
-        if (Feijoa::should_use_pdep()) {
-            assert(!feijoa.is_irreducible(std::true_type{}));
-            assert(!feijoa.is_quasi_irreducible(std::true_type{}).first);
-        }
+        assert(!feijoa.is_irreducible<Feijoa::RepeatedlySquarableClmul>());
+        assert(!feijoa.is_quasi_irreducible<Feijoa::RepeatedlySquarableClmul>().first);
+        ASSERT_IF_PDEP(!feijoa.is_irreducible<Feijoa::RepeatedlySquarablePdep>());
+        ASSERT_IF_PDEP(!feijoa.is_quasi_irreducible<Feijoa::RepeatedlySquarablePdep>().first);
     }
 
     {
@@ -67,26 +76,25 @@ int main() {
         assert(feijoa.reduce(feijoa.square(a)) == 0x47ff962ca9e606df);
         assert(feijoa.reduce(feijoa.shift_128(a)) == 0x6f010a6522f6d04a);
         assert(feijoa.reduce(feijoa.shift_512(a)) == 0x3c04fde0b1149209);
-        assert(eq(Feijoa::square(0xe30d03531263e5f5, std::false_type{}),
-                  Feijoa::Vector{0x0104140554115511, 0x5405005100051105}));
-        if (Feijoa::should_use_pdep()) {
-            assert(eq(Feijoa::square(0xe30d03531263e5f5, std::true_type{}),
-                      Feijoa::Vector{0x0104140554115511, 0x5405005100051105}));
-        }
-        assert(!feijoa.is_irreducible(std::false_type{}));
-        assert(!feijoa.is_quasi_irreducible(std::false_type{}).first);
-        if (Feijoa::should_use_pdep()) {
-            assert(!feijoa.is_irreducible(std::true_type{}));
-            assert(!feijoa.is_quasi_irreducible(std::true_type{}).first);
-        }
+        assert((Feijoa::RepeatedlySquarableClmul{feijoa, 0xb2a3023836224dae}.squared().reduced() ==
+                0x47ff962ca9e606df));
+        ASSERT_IF_PDEP(
+            (Feijoa::RepeatedlySquarablePdep{feijoa, 0xb2a3023836224dae}.squared().reduced() ==
+             0x47ff962ca9e606df));
+        assert(!feijoa.is_irreducible<Feijoa::RepeatedlySquarableClmul>());
+        assert(!feijoa.is_quasi_irreducible<Feijoa::RepeatedlySquarableClmul>().first);
+        ASSERT_IF_PDEP(!feijoa.is_irreducible<Feijoa::RepeatedlySquarablePdep>());
+        ASSERT_IF_PDEP(!feijoa.is_quasi_irreducible<Feijoa::RepeatedlySquarablePdep>().first);
         assert(feijoa.reduce(buffer, 64) == 0x45d383006154c9b7);
         assert(feijoa.reduce(buffer + 16, 48) == 0xfe98ad376a5e9a75);
         assert(feijoa.reduce(buffer, 0) == 0xe4414bba5ef801c5);
     }
 
     {
-        // x^64 + x^62 + x^61 + x^60 + x^57 + x^56 + x^54 + x^53 + x^48 + x^47 + x^46 + x^45 + x^41
-        //     + x^37 + x^35 + x^34 + x^32 + x^31 + x^30 + x^29 + x^28 + x^27 + x^25 + x^19 + x^18
+        // x^64 + x^62 + x^61 + x^60 + x^57 + x^56 + x^54 + x^53 + x^48 + x^47 + x^46 + x^45 +
+        // x^41
+        //     + x^37 + x^35 + x^34 + x^32 + x^31 + x^30 + x^29 + x^28 + x^27 + x^25 + x^19 +
+        //     x^18
         //     + x^17 + x^8 + x^4 + x^3 + x^2 + 1
         Feijoa feijoa{0x7361e22dfa0e011d};
         assert(feijoa.low_p_low_x_128_div_p.low() == 0x7361e22dfa0e011dU);
@@ -103,18 +111,15 @@ int main() {
         assert(feijoa.reduce(feijoa.square(a)) == 0x9682819ce543af15);
         assert(feijoa.reduce(feijoa.shift_128(a)) == 0x61017f24d3cfdfec);
         assert(feijoa.reduce(feijoa.shift_512(a)) == 0xd4d2d6bc13a5c724);
-        assert(eq(Feijoa::square(0xc78c0896c394c3cf, std::false_type{}),
-                  Feijoa::Vector{0x5005411050055055, 0x5015405000404114}));
-        if (Feijoa::should_use_pdep()) {
-            assert(eq(Feijoa::square(0xc78c0896c394c3cf, std::true_type{}),
-                      Feijoa::Vector{0x5005411050055055, 0x5015405000404114}));
-        }
-        assert(feijoa.is_irreducible(std::false_type{}));
-        assert(feijoa.is_quasi_irreducible(std::false_type{}).first);
-        if (Feijoa::should_use_pdep()) {
-            assert(feijoa.is_irreducible(std::true_type{}));
-            assert(feijoa.is_quasi_irreducible(std::true_type{}).first);
-        }
+        assert((Feijoa::RepeatedlySquarableClmul{feijoa, 0x412f5c88a5785e87}.squared().reduced() ==
+                0x9682819ce543af15));
+        ASSERT_IF_PDEP(
+            (Feijoa::RepeatedlySquarablePdep{feijoa, 0x412f5c88a5785e87}.squared().reduced() ==
+             0x9682819ce543af15));
+        assert(feijoa.is_irreducible<Feijoa::RepeatedlySquarableClmul>());
+        assert(feijoa.is_quasi_irreducible<Feijoa::RepeatedlySquarableClmul>().first);
+        ASSERT_IF_PDEP(feijoa.is_irreducible<Feijoa::RepeatedlySquarablePdep>());
+        ASSERT_IF_PDEP(feijoa.is_quasi_irreducible<Feijoa::RepeatedlySquarablePdep>().first);
         assert(feijoa.reduce(buffer, 64) == 0xb2d8e830efef6b49);
         assert(feijoa.reduce(buffer + 16, 48) == 0x6cc9738b07e91f18);
         assert(feijoa.reduce(buffer, 0) == 0x7361e22dfa0e011d);
@@ -130,23 +135,21 @@ int main() {
         // ) = x^64 + x^62 + x^61 + x^57 + x^56 + x^51 + x^48 + x^37 + x^36 + x^35 + x^30 + x^23
         //     + x^22 + x^21 + x^20 + x^19 + x^16 + x^13 + x^11 + x^5 + x^4 + x^3 + x^2 + x + 1
         Feijoa feijoa{0x6309003840f9283f};
-        assert(!feijoa.is_irreducible(std::false_type{}));
-        assert(feijoa.is_quasi_irreducible(std::false_type{}).first);
-        if (Feijoa::should_use_pdep()) {
-            assert(!feijoa.is_irreducible(std::true_type{}));
-            assert(feijoa.is_quasi_irreducible(std::true_type{}).first);
-        }
+        assert(!feijoa.is_irreducible<Feijoa::RepeatedlySquarableClmul>());
+        assert(feijoa.is_quasi_irreducible<Feijoa::RepeatedlySquarableClmul>().first);
+        ASSERT_IF_PDEP(!feijoa.is_irreducible<Feijoa::RepeatedlySquarablePdep>());
+        ASSERT_IF_PDEP(feijoa.is_quasi_irreducible<Feijoa::RepeatedlySquarablePdep>().first);
     }
 
     std::mt19937_64 generator{0};
-    assert(Feijoa::random(generator, std::false_type{}).is_irreducible());
-    if (Feijoa::should_use_pdep()) {
-        assert(Feijoa::random(generator, std::true_type{}).is_irreducible());
-    }
+    assert(Feijoa::random<Feijoa::RepeatedlySquarableClmul>(generator)
+               .is_irreducible<Feijoa::RepeatedlySquarableClmul>());
+    ASSERT_IF_PDEP(Feijoa::random<Feijoa::RepeatedlySquarablePdep>(generator)
+                       .is_irreducible<Feijoa::RepeatedlySquarablePdep>());
 
     auto feijoas = Feijoa::random_many<100>(generator);
     for (Feijoa &fejjoa : feijoas) {
-        assert(fejjoa.is_irreducible());
+        assert(fejjoa.is_irreducible<Feijoa::RepeatedlySquarableClmul>());
     }
     std::sort(feijoas.begin(), feijoas.end(),
               [](Feijoa &a, Feijoa &b) { return a.get_seed() < b.get_seed(); });

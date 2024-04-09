@@ -102,16 +102,55 @@ class Feijoa {
 #endif
     };
 
-    static inline bool should_use_pdep() {
 #ifdef __x86_64__
-        // AMD processors before Zen 3 have inefficient microcoded pdep.
-        return __builtin_cpu_supports("bmi2") &&
-               !(__builtin_cpu_is("amdfam15h") || __builtin_cpu_is("znver1") ||
-                 __builtin_cpu_is("znver2"));
-#else
-        return false;
+    class RepeatedlySquarablePdep {
+        const Feijoa *feijoa;
+        uint64_t value;
+
+      public:
+        static constexpr size_t parallelism = 6;
+
+        RepeatedlySquarablePdep() {}
+        explicit RepeatedlySquarablePdep(const Feijoa &feijoa, uint64_t value)
+            : feijoa(&feijoa), value(value) {}
+
+        RepeatedlySquarablePdep squared() const {
+            uint64_t high, low;
+            asm("pdep %1, %2, %0" : "=r"(high) : "r"(0x5555555555555555), "r"(value >> 32));
+            asm("pdep %1, %2, %0" : "=r"(low) : "r"(0x5555555555555555), "r"(value));
+            return RepeatedlySquarablePdep{*feijoa, feijoa->reduce(Vector{low, high})};
+        }
+
+        uint64_t reduced() const { return value; }
+
+        static bool is_available() {
+            // AMD processors before Zen 3 have inefficient microcoded pdep.
+            return __builtin_cpu_supports("bmi2") &&
+                   !(__builtin_cpu_is("amdfam15h") || __builtin_cpu_is("znver1") ||
+                     __builtin_cpu_is("znver2"));
+        }
+    };
 #endif
-    }
+
+    class RepeatedlySquarableClmul {
+        const Feijoa *feijoa;
+        Vector value;
+        explicit RepeatedlySquarableClmul(const Feijoa &feijoa, Vector value)
+            : feijoa(&feijoa), value(value) {}
+
+      public:
+        static constexpr size_t parallelism = 3;
+
+        RepeatedlySquarableClmul() {}
+        explicit RepeatedlySquarableClmul(const Feijoa &feijoa, uint64_t value)
+            : feijoa(&feijoa), value{value, 0} {}
+
+        RepeatedlySquarableClmul squared() const {
+            return RepeatedlySquarableClmul{*feijoa, feijoa->square(value)};
+        }
+
+        uint64_t reduced() const { return feijoa->reduce(value); }
+    };
 
     // Low half stores p(x) + x^64, high half stores x^128 // p(x) + x^64.
     Vector low_p_low_x_128_div_p;
@@ -190,31 +229,29 @@ class Feijoa {
     }
 
     inline void init_for_hashing(uint64_t x_128) {
-        auto x_256 = square(x_128, std::false_type{});
+        auto x_256 = Vector{x_128, 0}.multiply_low(Vector{x_128, 0});
         uint64_t x_512 = reduce(square(x_256));
         uint64_t x_576 = reduce(Vector{0, x_512});
         x_512_x_576 = Vector{x_512, x_576};
     }
 
     // Generates a random irreducible polynomial of degree 64 using the given random bit generator.
-    template <typename Generator, typename UsePdep>
-    static Feijoa random(Generator &generator, UsePdep use_pdep) {
+    template <typename RepeatedlySquarable, typename Generator>
+    static Feijoa random(Generator &generator) {
         bring_fs_into_cache();
 
         while (true) {
             // guess_irreducible() generates a polynomial that is irreducible with probability ~1/8.
             // This is still a lot. As the irreducability check is intrinsically sequential and does
             // not utilize 100% of CPU resources at any tick, it is reasonable to run several checks
-            // in lockstep to fill the pipeline better. 6/3 seem to be the most optimal factors with
-            // the current performance of Feijoa::Feijoa and is_quasi_irreducible_parallel,
-            // depending on whether BMI2 is available.
+            // in lockstep to fill the pipeline better.
 
-            std::array<Feijoa, use_pdep ? 6 : 3> feijoas;
+            std::array<Feijoa, RepeatedlySquarable::parallelism> feijoas;
             std::array<uint64_t, feijoas.size()> x_128;
             for (size_t i = 0; i < feijoas.size(); i++) {
                 x_128[i] = feijoas[i].init_for_basic_computations(guess_irreducible(generator));
             }
-            auto results = is_quasi_irreducible_parallel(feijoas, use_pdep);
+            auto results = is_quasi_irreducible_parallel<RepeatedlySquarable>(feijoas);
             for (size_t i = 0; i < feijoas.size(); i++) {
                 auto [quasi_irreducible, payload] = results[i];
                 if (quasi_irreducible && feijoas[i].is_really_irreducible(payload)) {
@@ -470,23 +507,6 @@ class Feijoa {
         return shift_128(a.multiply_high(a)) + a.multiply_low(a);
     }
 
-    // Given a(x), computes a(x)^2.
-    template <typename UsePdep> static Vector square(uint64_t a, UsePdep use_pdep) {
-        if constexpr (use_pdep) {
-#ifdef __x86_64__
-            uint64_t high, low;
-            asm("pdep %1, %2, %0" : "=r"(high) : "r"(0x5555555555555555), "r"(a >> 32));
-            asm("pdep %1, %2, %0" : "=r"(low) : "r"(0x5555555555555555), "r"(a));
-            return Vector{low, high};
-#else
-            __builtin_trap();
-#endif
-        } else {
-            Vector a_vec{a, 0};
-            return a_vec.multiply_low(a_vec);
-        }
-    }
-
     // Given a(x), computes a representative of a(x) * x^128 (mod p(x)).
     inline Vector shift_128(Vector a) const {
         // In F_2,
@@ -539,75 +559,38 @@ class Feijoa {
 
     // Tests if multiple p(x) pass a loose irreducibility check and returns initialization data for
     // a real check.
-    template <size_t N, typename UsePdep>
+    template <typename RepeatedlySquarable, size_t N>
     static std::array<std::pair<bool, uint64_t>, N>
-    is_quasi_irreducible_parallel(const std::array<Feijoa, N> &feijoas, UsePdep use_pdep) {
-        using element_type = typename std::conditional<use_pdep, uint64_t, Vector>::type;
-
-        element_type x_2_32[N];
-
+    is_quasi_irreducible_parallel(const std::array<Feijoa, N> &feijoas) {
         // Compute x^(2^32) via repeated squaring.
+        std::array<RepeatedlySquarable, N> x_2_32;
 
         // Initialize with x^(2^7) mod p(x).
         for (size_t i = 0; i < N; i++) {
-            if constexpr (use_pdep) {
-                x_2_32[i] = feijoas[i].x_128_x_192.low();
-            } else {
-                x_2_32[i] = feijoas[i].x_128_x_192.zero_high();
-            }
+            x_2_32[i] = RepeatedlySquarable{feijoas[i], feijoas[i].x_128_x_192.low()};
         }
 
         for (int i = 7; i < 32; i++) {
             for (size_t i = 0; i < N; i++) {
-                if constexpr (use_pdep) {
-                    x_2_32[i] = feijoas[i].reduce(feijoas[i].square(x_2_32[i], use_pdep));
-                } else {
-                    x_2_32[i] = feijoas[i].square(x_2_32[i]);
-                }
+                x_2_32[i] = x_2_32[i].squared();
             }
         }
 
         // Compute x^(2^64) as (x^(2^32))^(2^32)).
-        element_type x_2_64[N];
-        for (size_t i = 0; i < N; i++) {
-            x_2_64[i] = x_2_32[i];
-        }
+        std::array<RepeatedlySquarable, N> x_2_64 = x_2_32;
         for (int i = 32; i < 64; i++) {
             for (size_t i = 0; i < N; i++) {
-                if constexpr (use_pdep) {
-                    x_2_64[i] = feijoas[i].reduce(feijoas[i].square(x_2_64[i], use_pdep));
-                } else {
-                    x_2_64[i] = feijoas[i].square(x_2_64[i]);
-                }
+                x_2_64[i] = x_2_64[i].squared();
             }
         }
 
         std::array<std::pair<bool, uint64_t>, N> results;
         for (size_t i = 0; i < N; i++) {
             // x^(2^64) = x?
-            if constexpr (use_pdep) {
-                results[i] = {x_2_64[i] == 2, x_2_32[i]};
-            } else {
-                bool success = feijoas[i].reduce(x_2_64[i]) == 2;
-                results[i] = {success, success ? feijoas[i].reduce(x_2_32[i]) : 0};
-            }
+            bool success = x_2_64[i].reduced() == 2;
+            results[i] = {success, success ? x_2_32[i].reduced() : 0};
         }
         return results;
-    }
-
-    // Tests if p(x) is quasi-irreducible.
-    template <typename UsePdep>
-    std::pair<bool, uint64_t> is_quasi_irreducible(UsePdep use_pdep) const {
-        return is_quasi_irreducible_parallel(std::array<Feijoa, 1>{*this}, use_pdep)[0];
-    }
-
-    // Tests if p(x) is quasi-irreducible.
-    inline std::pair<bool, uint64_t> is_quasi_irreducible() const {
-        if (should_use_pdep()) {
-            return is_quasi_irreducible(std::true_type{});
-        } else {
-            return is_quasi_irreducible(std::false_type{});
-        }
     }
 
     // Tests if quasi-irreducible p(x) is irreducible.
@@ -641,9 +624,15 @@ class Feijoa {
         return true;
     }
 
+    // Tests if p(x) is quasi-irreducible.
+    template <typename RepeatedlySquarable> std::pair<bool, uint64_t> is_quasi_irreducible() const {
+        return is_quasi_irreducible_parallel<RepeatedlySquarable>(std::array<Feijoa, 1>{*this})[0];
+    }
+
     // Tests if p(x) is irreducible.
-    template <typename UsePdep> bool is_irreducible(UsePdep use_pdep) const {
-        auto results = is_quasi_irreducible_parallel(std::array<Feijoa, 1>{*this}, use_pdep);
+    template <typename RepeatedlySquarable> bool is_irreducible() const {
+        auto results =
+            is_quasi_irreducible_parallel<RepeatedlySquarable>(std::array<Feijoa, 1>{*this});
         auto [quasi_irreducible, payload] = results[0];
         return quasi_irreducible && is_really_irreducible(payload);
     }
@@ -658,11 +647,12 @@ class Feijoa {
 
     // Generates a random irreducible polynomial of degree 64 using the given random bit generator.
     template <typename Generator> static Feijoa random(Generator &generator) {
-        if (should_use_pdep()) {
-            return random(generator, std::true_type{});
-        } else {
-            return random(generator, std::false_type{});
+#ifdef __x86_64__
+        if (RepeatedlySquarablePdep::is_available()) {
+            return random<RepeatedlySquarablePdep>(generator);
         }
+#endif
+        return random<RepeatedlySquarableClmul>(generator);
     }
 
     // Generates several distinct random irreducible polynomials of degree 64 using the given random
@@ -698,15 +688,6 @@ class Feijoa {
             } while (std::find(feijoas.begin(), it, *it) != it);
         }
         return feijoas;
-    }
-
-    // Tests if p(x) is irreducible.
-    inline bool is_irreducible() const {
-        if (should_use_pdep()) {
-            return is_irreducible(std::true_type{});
-        } else {
-            return is_irreducible(std::false_type{});
-        }
     }
 
     // Returns a seed that can be used to restore the Feijoa instance later.
