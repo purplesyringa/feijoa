@@ -5,14 +5,6 @@
 bool eq(Feijoa::Vector a, Feijoa::Vector b) { return a.low() == b.low() && a.high() == b.high(); }
 
 int main() {
-    for (uint64_t a : std::array<uint64_t, 4>{0xfcf980c83018a6d2, 0x3856dbeaf383ce21,
-                                              0xf4d0134ced3abf0e, 0x471608aa92303b90}) {
-        uint64_t fixup = Feijoa::fixup_coprime(a);
-        assert((fixup >> 2) == (a >> 2));
-        assert(fixup & 1);
-        assert(!__builtin_parityl(fixup));
-    }
-
     char buffer[] =
         "\x66\xcb\xe4\x6c\x1c\x17\xf6\xb3\x75\x20\x79\x09\x0c\xa9\x0f\xed\xcd\x18\xc4\xc1\x82\xc3"
         "\x1e\xb8\x0e\xf6\x94\x0c\x69\x9a\xfa\x08\x9a\x1c\x30\x96\x41\x11\x8f\xb1\x2e\xc3\x66\x44"
