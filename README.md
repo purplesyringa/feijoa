@@ -1,5 +1,7 @@
 # Feijoa
 
+> **Disclaimer:** [CLHash](https://github.com/lemire/clhash) provides better guarantees while performing faster. However, it currently doesn't support ARM and requires SSE4.1, while Feijoa supports ARM NEON and only requires [CLMUL](https://en.wikipedia.org/wiki/CLMUL_instruction_set) on x86. Do with this what you will.
+
 **Feijoa** is a highly efficient hash-like cryptographic primitive.
 
 It provides the same interface that typical salted hash functions provide: you initialize a hasher object with a salt, which then allows you to compute 64-bit hashes of byte objects. However, the security guarantees differ from those of typical hash functions like xxhash or SHA:
